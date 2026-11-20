@@ -10,21 +10,25 @@
         label_type: 1,
         speed: 1,
     };
-    const size = { w_px: 142, h_px: 260, dpi: 300, offset_y_px: -6 };
+    const formats = {
+        22: { w_px: 142, h_px: 260, dpi: 300, offset_y_px: -6 },
+        40: { w_px: 142, h_px: 472, dpi: 300, offset_y_px: 0 },
+    };
     let printing = false;
     let activeLabel;
     let toolbar;
     let tabs;
 
-    function makeLabel(qrModules, inventoryNumber, year) {
+    function makeLabel(qrModules, inventoryNumber, year, size) {
         const grid = Math.sqrt(qrModules.length);
         const version = (grid - 17) / 4;
         if (!Number.isInteger(version) || version < 1 || version > 40 || /[^01]/.test(qrModules)) {
             throw new Error('Не удалось определить сетку QR-кода.');
         }
-        const dot = Math.floor(Math.min(size.w_px, size.h_px) / (grid + 8));
-        if (dot < 2) {
-            throw new Error('QR-код слишком плотный для этикетки 12 × 22 мм.');
+        const qrArea = Math.min(size.w_px, size.h_px);
+        const paddedGrid = grid + 8;
+        if (qrArea < paddedGrid * 2) {
+            throw new Error('QR-код слишком плотный для этикетки шириной 12 мм.');
         }
 
         const canvas = document.createElement('canvas');
@@ -36,13 +40,13 @@
         writer.fillStyle = '#000';
         const landscapeWidth = canvas.height;
         const landscapeHeight = canvas.width;
+        const longLabel = size === formats[40];
         const lines = [
-            { text: inventoryNumber, fontSize: 16, heightScale: 1.6 },
-            { text: year, fontSize: 18, heightScale: 1.45 },
+            { text: inventoryNumber, fontSize: longLabel ? 24 : 17, heightScale: longLabel ? 1.55 : 2.3 },
+            { text: year, fontSize: longLabel ? 27 : 19, heightScale: longLabel ? 1.45 : 1.7 },
         ].filter(line => line.text);
-        const lineHeight = 29;
-        const qrArea = (grid + 8) * dot;
-        const gap = lines.length ? 4 : 0;
+        const lineHeight = longLabel ? 40 : 34;
+        const gap = lines.length ? 2 : 0;
         const maxTextWidth = landscapeWidth - qrArea - gap - 12;
         let textWidth = 0;
         for (const line of lines) {
@@ -64,14 +68,19 @@
             }
         }
         const contentLeft = Math.floor((landscapeWidth - qrArea - gap - textWidth) / 2);
-        const labelLeft = contentLeft + 4 * dot;
-        const labelTop = Math.floor((landscapeHeight - qrArea) / 2) + 4 * dot;
+        const labelTop = Math.floor((landscapeHeight - qrArea) / 2);
+        const boundaries = Array.from({ length: grid + 1 }, (_, index) => Math.round((index + 4) * qrArea / paddedGrid));
         writer.translate(canvas.width, 0);
         writer.rotate(Math.PI / 2);
         for (let row = 0; row < grid; row++) {
             for (let column = 0; column < grid; column++) {
                 if (qrModules[row * grid + column] === '1') {
-                    writer.fillRect(labelLeft + column * dot, labelTop + row * dot, dot, dot);
+                    writer.fillRect(
+                        contentLeft + boundaries[column],
+                        labelTop + boundaries[row],
+                        boundaries[column + 1] - boundaries[column],
+                        boundaries[row + 1] - boundaries[row],
+                    );
                 }
             }
         }
@@ -87,6 +96,27 @@
             writer.fillText(line.text, 0, 0, line.width);
             writer.restore();
         }
+
+        writer.resetTransform();
+        const bitmap = writer.getImageData(0, 0, canvas.width, canvas.height);
+        let firstInkRow = canvas.height;
+        let lastInkRow = -1;
+        for (let row = 0; row < canvas.height; row++) {
+            const rowStart = row * canvas.width * 4;
+            for (let column = 0; column < canvas.width; column++) {
+                if (bitmap.data[rowStart + column * 4] >= 128) continue;
+                firstInkRow = Math.min(firstInkRow, row);
+                lastInkRow = row;
+                break;
+            }
+        }
+        const centeredOffset = Math.round((canvas.height - 1 - firstInkRow - lastInkRow) / 2);
+        const shift = Math.max(-contentLeft, Math.min(centeredOffset, canvas.height - 1 - lastInkRow));
+        if (shift !== 0) {
+            writer.fillStyle = '#fff';
+            writer.fillRect(0, 0, canvas.width, canvas.height);
+            writer.putImageData(bitmap, 0, shift);
+        }
         return canvas.toDataURL('image/png');
     }
 
@@ -96,11 +126,22 @@
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'btn btn-outline-primary btn-sm niimprint-button';
-        button.textContent = 'Распечатать QR · 12 × 22 мм';
+        const format = document.createElement('select');
+        format.className = 'form-select form-select-sm w-auto niimprint-format';
+        format.setAttribute('aria-label', 'Размер этикетки');
+        for (const length of Object.keys(formats)) {
+            format.add(new Option(`12 × ${length} мм`, length));
+        }
+        format.value = '40';
+        function updateButton() {
+            button.textContent = `Распечатать QR · 12 × ${format.value} мм`;
+        }
+        format.addEventListener('change', updateButton);
+        updateButton();
         const status = document.createElement('div');
         status.className = 'small';
         status.setAttribute('role', 'status');
-        container.append(button, status);
+        container.append(format, button, status);
 
         button.addEventListener('click', async () => {
             if (printing || !activeLabel) return;
@@ -110,9 +151,10 @@
                 status.textContent = 'Откройте GLPI по HTTPS в Chrome с доступом к Bluetooth.';
                 return;
             }
-            printing = button.disabled = true;
+            const size = formats[format.value];
+            printing = button.disabled = format.disabled = true;
             try {
-                const label = makeLabel(qrModules, inventoryNumber.trim(), year);
+                const label = makeLabel(qrModules, inventoryNumber.trim(), year, size);
                 status.textContent = 'Подключение к принтеру…';
                 await driver.identify(model);
                 if (driver.printer?.modelId !== model.id) {
@@ -144,7 +186,7 @@
                     status.textContent = error.message;
                 }
             } finally {
-                printing = button.disabled = false;
+                printing = button.disabled = format.disabled = false;
             }
         });
         return container;
