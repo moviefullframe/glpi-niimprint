@@ -10,16 +10,13 @@
         label_type: 1,
         speed: 1,
     };
-    const formats = {
-        22: { w_px: 142, h_px: 260, dpi: 300, offset_y_px: -6 },
-        40: { w_px: 142, h_px: 472, dpi: 300, offset_y_px: 0 },
-    };
+    const size = { w_px: 142, h_px: 472, dpi: 300, offset_y_px: 0 };
     let printing = false;
     let activeLabel;
     let toolbar;
     let tabs;
 
-    function makeLabel(qrModules, inventoryNumber, year, size) {
+    function makeLabel(qrModules, inventoryNumber, year) {
         const grid = Math.sqrt(qrModules.length);
         const version = (grid - 17) / 4;
         if (!Number.isInteger(version) || version < 1 || version > 40 || /[^01]/.test(qrModules)) {
@@ -40,12 +37,11 @@
         writer.fillStyle = '#000';
         const landscapeWidth = canvas.height;
         const landscapeHeight = canvas.width;
-        const longLabel = size === formats[40];
         const lines = [
-            { text: inventoryNumber, fontSize: longLabel ? 24 : 17, heightScale: longLabel ? 1.55 : 2.3 },
-            { text: year, fontSize: longLabel ? 27 : 19, heightScale: longLabel ? 1.45 : 1.7 },
+            { text: inventoryNumber, fontSize: 24, heightScale: 1.55 },
+            { text: year, fontSize: 27, heightScale: 1.45 },
         ].filter(line => line.text);
-        const lineHeight = longLabel ? 40 : 34;
+        const lineHeight = 40;
         const gap = lines.length ? 2 : 0;
         const maxTextWidth = landscapeWidth - qrArea - gap - 12;
         let textWidth = 0;
@@ -126,22 +122,11 @@
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'btn btn-outline-primary btn-sm niimprint-button';
-        const format = document.createElement('select');
-        format.className = 'form-select form-select-sm w-auto niimprint-format';
-        format.setAttribute('aria-label', 'Размер этикетки');
-        for (const length of Object.keys(formats)) {
-            format.add(new Option(`12 × ${length} мм`, length));
-        }
-        format.value = '40';
-        function updateButton() {
-            button.textContent = `Распечатать QR · 12 × ${format.value} мм`;
-        }
-        format.addEventListener('change', updateButton);
-        updateButton();
+        button.textContent = 'Распечатать QR-код';
         const status = document.createElement('div');
         status.className = 'small';
         status.setAttribute('role', 'status');
-        container.append(format, button, status);
+        container.append(button, status);
 
         button.addEventListener('click', async () => {
             if (printing || !activeLabel) return;
@@ -151,10 +136,9 @@
                 status.textContent = 'Откройте GLPI по HTTPS в Chrome с доступом к Bluetooth.';
                 return;
             }
-            const size = formats[format.value];
-            printing = button.disabled = format.disabled = true;
+            printing = button.disabled = true;
             try {
-                const label = makeLabel(qrModules, inventoryNumber.trim(), year, size);
+                const label = makeLabel(qrModules, inventoryNumber.trim(), year);
                 status.textContent = 'Подключение к принтеру…';
                 await driver.identify(model);
                 if (driver.printer?.modelId !== model.id) {
@@ -186,7 +170,7 @@
                     status.textContent = error.message;
                 }
             } finally {
-                printing = button.disabled = format.disabled = false;
+                printing = button.disabled = false;
             }
         });
         return container;

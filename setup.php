@@ -18,7 +18,7 @@ function plugin_version_niimprint(): array
 {
     return [
         'name' => 'NIIMBOT QR Print',
-        'version' => '0.6.7',
+        'version' => '0.6.8',
         'requirements' => [
             'glpi' => ['min' => '11.0.0', 'max' => '12.0.99'],
         ],
