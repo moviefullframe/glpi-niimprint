@@ -1,5 +1,9 @@
 <?php
 
+use Com\Tecnick\Barcode\Barcode;
+
+require_once __DIR__ . '/inc/settings.class.php';
+
 function plugin_niimprint_install(): bool
 {
     return true;
@@ -7,6 +11,7 @@ function plugin_niimprint_install(): bool
 
 function plugin_niimprint_uninstall(): bool
 {
+    PluginNiimprintSettings::remove();
     return true;
 }
 
@@ -24,13 +29,25 @@ function plugin_niimprint_render_label_data(array $params): void
         return;
     }
 
-    $barcode = (new BarcodeManager())->generateQRCode($item);
-    if (!$barcode) {
-        return;
+    $settings = PluginNiimprintSettings::load();
+    $fields = $settings['fields'];
+    $inventory = (string) ($item->fields['otherserial'] ?? '');
+    $barcode = null;
+    $error = '';
+    if ($settings['qr'] === 'inventory') {
+        if (trim($inventory) === '') {
+            $error = 'Для печати заполните инвентарный номер в карточке.';
+        } elseif (strlen($inventory) > 512) {
+            $error = 'Инвентарный номер слишком длинный для QR-кода этой этикетки.';
+        } else {
+            $barcode = (new Barcode())->getBarcodeObj('QRCODE,H', $inventory);
+        }
+    } else {
+        $barcode = (new BarcodeManager())->generateQRCode($item);
     }
 
     $year = '';
-    if (Session::haveRight(Infocom::$rightname, READ)) {
+    if (in_array('year', $fields, true) && Session::haveRight(Infocom::$rightname, READ)) {
         $financialInfo = new Infocom();
         if (
             $financialInfo->getFromDBforDevice($item::class, $item->getID())
@@ -40,11 +57,20 @@ function plugin_niimprint_render_label_data(array $params): void
         }
     }
 
-    printf(
-        '<span hidden data-niimprint-item="%d" data-inventory-number="%s" data-year="%s" data-qr-modules="%s"></span>',
-        $item->getID(),
-        htmlspecialchars($item->fields['otherserial'] ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'),
-        $year,
-        htmlspecialchars(str_replace("\n", '', trim($barcode->getGrid())), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-    );
+    $attributes = [
+        'niimprint-item' => $item->getID(),
+        'niimprint-url' => $item::getFormURLWithID($item->getID()),
+        'inventory-number' => in_array('inventory', $fields, true) ? $inventory : '',
+        'asset-name' => in_array('name', $fields, true) ? ($item->fields['name'] ?? '') : '',
+        'serial' => in_array('serial', $fields, true) ? ($item->fields['serial'] ?? '') : '',
+        'year' => $year,
+        'size' => $settings['size'],
+        'print-error' => $error,
+        'qr-modules' => $barcode ? str_replace("\n", '', trim($barcode->getGrid())) : '',
+    ];
+    echo '<span hidden';
+    foreach ($attributes as $key => $value) {
+        printf(' data-%s="%s"', $key, htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'));
+    }
+    echo '></span>';
 }

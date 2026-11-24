@@ -1,7 +1,10 @@
+import { printLabel } from './vendor/niimbot.js?v=0.8.0';
+
 (() => {
     'use strict';
 
-    const model = {
+    const d11 = {
+        name: 'D11_H',
         id: 528,
         name_prefixes: ['D11'],
         task: 'v4',
@@ -10,22 +13,34 @@
         label_type: 1,
         speed: 1,
     };
-    const size = { w_px: 142, h_px: 472, dpi: 300, offset_y_px: 0 };
+    const b21 = { ...d11, name: 'B21 Pro', id: 785, name_prefixes: ['B21', 'NIIMBOT B21'] };
+    const b21Rolls = {
+        '40x30': { w_px: 472, h_px: 354, dpi: 300, offset_y_px: 0 },
+        '50x30': { w_px: 576, h_px: 354, dpi: 300, offset_y_px: 0 },
+    };
+    const sizes = {
+        '12x40': { w_px: 142, h_px: 472, dpi: 300, offset_y_px: 0 },
+        '12x22': { w_px: 142, h_px: 260, dpi: 300, offset_y_px: -6 },
+        '15x30': { w_px: 144, h_px: 354, dpi: 300, offset_y_px: 0 },
+    };
     let printing = false;
     let activeLabel;
     let toolbar;
     let tabs;
 
-    function makeLabel(qrModules, inventoryNumber, year) {
+    function makeLabel(qrModules, size, lines) {
         const grid = Math.sqrt(qrModules.length);
         const version = (grid - 17) / 4;
         if (!Number.isInteger(version) || version < 1 || version > 40 || /[^01]/.test(qrModules)) {
             throw new Error('Не удалось определить сетку QR-кода.');
         }
-        const qrArea = Math.min(size.w_px, size.h_px);
+        const landscapeWidth = Math.max(size.w_px, size.h_px);
+        const landscapeHeight = Math.min(size.w_px, size.h_px);
+        const rotate = size.h_px > size.w_px;
+        const qrArea = !rotate && lines.length ? Math.floor(landscapeWidth / 2) : landscapeHeight;
         const paddedGrid = grid + 8;
         if (qrArea < paddedGrid * 2) {
-            throw new Error('QR-код слишком плотный для этикетки шириной 12 мм.');
+            throw new Error('QR-код слишком плотный для этикетки выбранного размера.');
         }
 
         const canvas = document.createElement('canvas');
@@ -35,30 +50,23 @@
         writer.fillStyle = '#fff';
         writer.fillRect(0, 0, canvas.width, canvas.height);
         writer.fillStyle = '#000';
-        const landscapeWidth = canvas.height;
-        const landscapeHeight = canvas.width;
-        const lines = [
-            { text: inventoryNumber, fontSize: 24, heightScale: 1.55 },
-            { text: year, fontSize: 27, heightScale: 1.45 },
-        ].filter(line => line.text);
-        const lineHeight = 40;
+        const lineHeight = Math.min(40, Math.floor((landscapeHeight - 8) / Math.max(lines.length, 1)));
         const gap = lines.length ? 2 : 0;
         const maxTextWidth = landscapeWidth - qrArea - gap - 12;
         let textWidth = 0;
         for (const line of lines) {
+            line.fontSize = Math.min(line.fontSize, Math.floor(lineHeight / line.heightScale));
             while (true) {
                 line.font = `bold ${line.fontSize}px monospace`;
                 writer.font = line.font;
                 const lineWidth = Math.ceil(writer.measureText(line.text).width);
                 if (lineWidth <= maxTextWidth) {
-                    line.font = `bold ${line.fontSize + 1}px monospace`;
-                    writer.font = line.font;
-                    line.width = Math.min(maxTextWidth, Math.ceil(writer.measureText(line.text).width));
+                    line.width = lineWidth;
                     textWidth = Math.max(textWidth, line.width);
                     break;
                 }
                 if (line.fontSize <= 10) {
-                    throw new Error('Инвентарный номер слишком длинный для этой этикетки.');
+                    throw new Error('Строка текста слишком длинная. Выберите больший размер этикетки или отключите поле в настройках.');
                 }
                 line.fontSize--;
             }
@@ -66,8 +74,10 @@
         const contentLeft = Math.floor((landscapeWidth - qrArea - gap - textWidth) / 2);
         const labelTop = Math.floor((landscapeHeight - qrArea) / 2);
         const boundaries = Array.from({ length: grid + 1 }, (_, index) => Math.round((index + 4) * qrArea / paddedGrid));
-        writer.translate(canvas.width, 0);
-        writer.rotate(Math.PI / 2);
+        if (rotate) {
+            writer.translate(canvas.width, 0);
+            writer.rotate(Math.PI / 2);
+        }
         for (let row = 0; row < grid; row++) {
             for (let column = 0; column < grid; column++) {
                 if (qrModules[row * grid + column] === '1') {
@@ -93,6 +103,7 @@
             writer.restore();
         }
 
+        if (!rotate) return canvas;
         writer.resetTransform();
         const bitmap = writer.getImageData(0, 0, canvas.width, canvas.height);
         let firstInkRow = canvas.height;
@@ -113,7 +124,7 @@
             writer.fillRect(0, 0, canvas.width, canvas.height);
             writer.putImageData(bitmap, 0, shift);
         }
-        return canvas.toDataURL('image/png');
+        return canvas;
     }
 
     function makeToolbar() {
@@ -126,27 +137,49 @@
         const status = document.createElement('div');
         status.className = 'small';
         status.setAttribute('role', 'status');
-        container.append(button, status);
+        const profile = document.createElement('select');
+        profile.className = 'form-select form-select-sm w-auto';
+        profile.setAttribute('aria-label', 'Принтер и размер этикетки');
+        profile.add(new Option('D11_H — размер из настроек', 'd11'));
+        for (const roll of Object.keys(b21Rolls)) {
+            profile.add(new Option(`B21 Pro — ${roll.replace('x', ' × ')} мм`, roll));
+        }
+        container.append(profile, button, status);
 
         button.addEventListener('click', async () => {
-            if (printing || !activeLabel) return;
-            const { qrModules, inventoryNumber, year } = activeLabel.dataset;
-            const driver = window.Niimbot;
-            if (!driver?.isSupported()) {
-                status.textContent = 'Откройте GLPI по HTTPS в Chrome с доступом к Bluetooth.';
+            scan();
+            if (printing || !activeLabel || toolbar !== container) return;
+            const selected = activeLabel;
+            const { qrModules, assetName, inventoryNumber, serial, year, printError } = selected.dataset;
+            const model = profile.value === 'd11' ? d11 : b21;
+            const size = model === d11 ? sizes[selected.dataset.size] : b21Rolls[profile.value];
+            if (printError || !size) {
+                status.textContent = printError || 'Неизвестный размер этикетки.';
                 return;
             }
-            printing = button.disabled = true;
+            if (typeof navigator.bluetooth?.requestDevice !== 'function') {
+                status.textContent = window.isSecureContext
+                    ? 'Этот браузер не предоставляет доступ к Web Bluetooth. На Android откройте карточку прямо в приложении Chrome. На iPhone используйте браузер с поддержкой Web Bluetooth или печатайте с компьютера.'
+                    : 'Браузер не считает страницу защищённой. Откройте GLPI напрямую по HTTPS и проверьте, что браузер доверяет сертификату.';
+                return;
+            }
+            printing = profile.disabled = button.disabled = true;
             try {
-                const label = makeLabel(qrModules, inventoryNumber.trim(), year);
+                const lines = [
+                    { text: assetName, fontSize: 24, heightScale: 1.45 },
+                    { text: inventoryNumber, fontSize: 24, heightScale: 1.55 },
+                    { text: serial, fontSize: 24, heightScale: 1.45 },
+                    { text: year, fontSize: 27, heightScale: 1.45 },
+                ].filter(line => line.text?.trim());
+                const label = makeLabel(qrModules, size, lines);
                 status.textContent = 'Подключение к принтеру…';
-                await driver.identify(model);
-                if (driver.printer?.modelId !== model.id) {
-                    await driver.disconnect();
-                    throw new Error('Выберите принтер NIIMBOT D11_H.');
-                }
-                status.textContent = 'Печать…';
-                await driver.printImage(label, { model, size, strictAcknowledgements: true });
+                await printLabel(label, model, size, () => {
+                    scan();
+                    if (activeLabel !== selected) {
+                        throw new Error('Карточка изменилась. Выберите этикетку заново.');
+                    }
+                    status.textContent = 'Печать…';
+                });
                 status.textContent = 'Принтер подтвердил печать.';
             } catch (error) {
                 const stage = {
@@ -170,7 +203,7 @@
                     status.textContent = error.message;
                 }
             } finally {
-                printing = button.disabled = false;
+                printing = profile.disabled = button.disabled = false;
             }
         });
         return container;
@@ -186,12 +219,21 @@
         }
 
         const id = new URLSearchParams(window.location.search).get('id') ?? '';
-        if (!tabs || !/^[1-9][0-9]*$/.test(id)) return;
-
-        const activePane = tabs.querySelector('[data-glpi-tab-content].active');
-        const label = activePane?.querySelector(`[data-niimprint-item="${id}"][data-qr-modules]`);
-        if (label) activeLabel = label;
-        if (!activeLabel) return;
+        const activePane = tabs?.querySelector('[data-glpi-tab-content].active');
+        const page = new URL(window.location.href);
+        const label = /^[1-9][0-9]*$/.test(id) && activePane
+            ? Array.from(activePane.querySelectorAll(`[data-niimprint-item="${id}"][data-niimprint-url][data-qr-modules]`)).find(candidate => {
+                const asset = new URL(candidate.dataset.niimprintUrl, page);
+                return asset.origin === page.origin && asset.pathname === page.pathname
+                    && Array.from(asset.searchParams).every(([key, value]) => page.searchParams.get(key) === value);
+            })
+            : undefined;
+        if (label !== activeLabel || !label) {
+            toolbar?.remove();
+            toolbar = undefined;
+            activeLabel = label;
+        }
+        if (!label) return;
         toolbar ??= makeToolbar();
         const qrField = activePane?.querySelector('[data-testid="form-field-qrcode"]');
         if (qrField?.querySelector('img')) {
