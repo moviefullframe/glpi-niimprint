@@ -1,54 +1,6 @@
-/* ── niimbot.js — Web Bluetooth driver for Niimbot printers ───────────────────
- * Generic and application-agnostic. Protocol V4, with two print-task variants:
- *   "v4"  D11 / B1 Pro / B21 Pro line (300 dpi)  — validated on real B1 Pro
- *   "b1"  B1 / B21 line (203 dpi)                 — see registry.json `task`
- * Reverse-engineered against niimbluelib; the task is chosen per model.
- *
- * No dependencies, no build. Load with <script src="niimbot.js"></script> and
- * use the global `window.Niimbot` API. It reads no config of its own and owns no
- * UI — the app passes the printer model and label size (see registry.json). It
- * does `fetch` the image URL it is given and rasterize it on an offscreen
- * <canvas> (`imageToPacked`); nothing is added to the page.
- *
- *   await Niimbot.printImage(pngUrl, { model, size, onProgress });
- *   await Niimbot.printBatch([url1, url2], { model, size, onProgress });
- *
- * Both RESOLVE only when the printer confirmed the job — every page acknowledged
- * and the printed-page counter reaching the total. If it did not, they REJECT
- * with a message naming what stalled and where, after sending PrintEnd so the
- * paper is still fed out. They used to resolve either way, which is how a run
- * that printed 4 of 5 labels reported success (measured 2026-08-13). Treat a
- * rejection as "check the paper", not as "nothing printed": some of it did.
- *
- *   model: { name_prefixes:[], task, density, label_type, speed }  (from registry.json)
- *   size:  { w_px, h_px }                                      (from registry.json)
- *
- * Requirements: a browser with Web Bluetooth, over HTTPS (or localhost). Which
- * browsers qualify (and the iOS polyfill route) is in the README's Requirements
- * table — check Niimbot.isSupported() before offering it.
- *
- * Print flow (one job, N pages): connect → SetDensity → SetLabelType →
- *   PrintStart (declares N pages) → for each page: SetPageSize → rows
- *   (0x84 empty / 0x85 with pixels, run-length) → PageEnd (0xE3) → … →
- *   PrintEnd (0xF3) once at the end.
- *
- *   PrintEnd (0xF3) is what feeds out + retracts the paper, so it runs exactly
- *   once per job, not per page — otherwise the printer stops and pulls the paper
- *   back between every label. Pages are pipelined with a look-ahead (the next page
- *   is queued while the current one prints, throttled via the 0xA3→0xB3 status
- *   counter), which removes the retract between labels.
- *
- *   It does NOT always remove the PAUSE between labels, and this comment used to
- *   claim it did. Whether the paper keeps moving depends on which is faster, the
- *   send or the print. Measured on a B1 Pro, 2026-08-13, dense pages in "paced":
- *   ~255 row-writes × PACE_MS 10 ms ⇒ ~3 s to send a page, while the printer
- *   finished one in less — so it waited, and the pause is visible on the paper
- *   path. In "fast" the send is quick enough that the same batch streams. The
- *   look-ahead hides latency; it cannot create bandwidth.
+/* GLPI adapter of niimbot-web-bluetooth 2.6.0 (iscarelli, MIT).
+ * One private connection per label. See LICENSE.
  */
-(function (root) {
-  "use strict";
-
   const VERSION = "2.6.0";   // shown in the demo/console; bump on each release (or dev change)
   const SVC_UUID = "e7810a71-73ae-499d-8c15-faa9aef0c3f2";
   const CHAR_UUID = "bef8d6c9-9c21-4c9e-b632-bd58c1009f9f";
@@ -157,8 +109,15 @@
     if (v.getUint8(0) !== 0x55 || v.getUint8(1) !== 0x55) return;
     const cmd = v.getUint8(2);
     const len = v.getUint8(3);
+    if (v.byteLength !== len + 7 || v.getUint8(len + 5) !== 0xaa || v.getUint8(len + 6) !== 0xaa) return;
     const data = [];
-    for (let i = 0; i < len && 4 + i < v.byteLength; i++) data.push(v.getUint8(4 + i));
+    let checksum = cmd ^ len;
+    for (let i = 0; i < len; i++) {
+      const byte = v.getUint8(4 + i);
+      checksum ^= byte;
+      data.push(byte);
+    }
+    if (checksum !== v.getUint8(len + 4)) return;
     logRx(cmd, data);
     if (cmd === 0xd3 && data.length >= 2) {
       const rowIdx = (data[0] << 8) | data[1];
@@ -393,6 +352,7 @@
   // level, the upstream's documented default (0=0%, 1=25%, 2=50%, 3=75%, 4=100%). The
   // two origins below are NOT the same kind of claim — see each entry.
   const MODEL_IDS = {
+    785: { label: "NIIMBOT B21 Pro", task: "v4", dpi: 300, paced: true, bundle: false },
     4096: { label: "Niimbot B1",     task: "b1", dpi: 203, paced: true,  bundle: true,  batteryScale: "enum" },     // MEASURED 2026-09-10 against the official NIIMBOT app: chargeLevel read 4 and the app showed 100% — a percent scale would have shown 4%, so enum is what explains the reading
     4097: { label: "Niimbot B1 Pro", task: "v4", dpi: 300, paced: false, bundle: false, batteryScale: "percent" }, // MEASURED here: chargeLevel read 0x50 (80) across six captures and 0x28 (40) in another, and on that same connection 0x40[0x0a] answered the same 0x28 — consistent with a 0-100 percent, not a 0-4 level
     4098: { label: "Niimbot B1 SE",  task: "b1", dpi: 203, paced: true,  bundle: false, batteryScale: "enum" },     // "enum" is the upstream default; not verified on this model
@@ -545,7 +505,7 @@
     // cause was Brave — which ships without Web Bluetooth, behind a flag — not
     // exposing the API at all.
     if (!navigator.bluetooth) {
-      if (root.isSecureContext) {
+      if (globalThis.isSecureContext) {
         throw new Error("This browser doesn't expose Web Bluetooth (the page is secure, so that's not the issue). Use Chrome, Edge or Opera on desktop, or Chrome on Android — Brave and some other Chromium builds ship Web Bluetooth off by default, behind a flag.");
       }
       throw new Error("Web Bluetooth unavailable (use Chrome/Edge over HTTPS).");
@@ -584,10 +544,11 @@
     // on a phone, where this log panel is the only trace, that is unreadable. NOT gated
     // behind DEBUG, for the same reason the connect summary line is not.
     device.addEventListener("gattserverdisconnected", () => {
+      characteristic?.removeEventListener("characteristicvaluechanged", onNotify);
       const wasConnected = characteristic != null;
       characteristic = null;
       if (wasConnected) logMsg("printer disconnected (link dropped — reconnect to continue)");
-    });
+    }, { once: true });
     // Initial connection packet (raw, 0x03 prefix — same as niimblue).
     await writeRaw(new Uint8Array([0x03, 0x55, 0x55, 0xc1, 0x01, 0x01, 0xc1, 0xaa, 0xaa]));
     await sleep(200);
@@ -611,336 +572,22 @@
     // nobody could see it. One line per connect.
     logAlways(`writeMode=${writeMode} override=${writeOverride || "auto"} effective=${effectiveWriteMode()} forcePacing=${writeOverride === "paced"} bundle=${effectiveBundle()} (detected=${_bundleAllowed}) mac=${IS_MAC} [${MAC_SOURCE}] pace=${PACE_MS} (task=${task || "?"}, model=${(meta && meta.label) || "?"}, write=${!!props.write}, writeNoResp=${!!props.writeWithoutResponse})`);
     warnOverrideVsModel();   // now that the model is identified, an override that fights it is worth saying
-    if (task === "b1") await b1Handshake();
+
   }
 
   // Drop the BLE connection so a different printer can be paired/identified. Clears
   // all connection state (incl. the detected printerInfo); the next print reconnects.
   async function disconnect() {
+    characteristic?.removeEventListener("characteristicvaluechanged", onNotify);
     try { if (device && device.gatt && device.gatt.connected) device.gatt.disconnect(); }
     catch (e) { /* already gone */ }
     characteristic = null; device = null; pendingQueue = []; lastUnsolicited = null; printerInfo = null;
     logMsg("disconnected");
   }
 
-  // The protocol-3 B1 will accept all the setup commands but never actually start
-  // printing (PageEnd gets no 0xE4, status frozen at state 0x02) unless it first
-  // sees the same post-connect handshake niim.blue does: read status + printer info
-  // + a heartbeat. These are reads/keepalives that "arm" the printer for a job.
-  async function b1Handshake() {
-    logMsg("B1 handshake (status + info + heartbeat)");
-    await sendWait(0xa5, [0x01], 0xb5, 1000);                  // PrinterStatusData
-    for (const sub of [0x08, 0x0b, 0x0d, 0x0a, 0x07, 0x03, 0x0c, 0x09]) {
-      await sendWait(0x40, [sub], null, 600);                  // PrinterInfo (response code varies)
-    }
-    await sendWait(0xdc, [0x04], 0xd9, 1000);                  // Heartbeat
-  }
-
-  // ── Consumable status: EXPOSED, never enforced ──────────────────────────────
-  // Heartbeat (0xDC[04] → 0xD9) and RfidInfo (0x1A[01] → 0x1B) say whether the lid is
-  // shut, paper is loaded and what the RFID consumable claims. NOTHING in this driver
-  // reads these fields: no print path calls getStatus() or branches on it, and that is
-  // still true now that some of them are hardware-confirmed. Six captures on ONE model
-  // is not a licence to refuse a job into a printer that is actually loaded, so
-  // `readiness()` below REPORTS and is wired to nothing.
-  //
-  // TRUST IS PER FIELD, not per response — `decoded.evidence` marks every decoded field
-  // (see docs/protocol-v4.md § Consumable status for the capture table it comes from):
-  //   "observed"     the byte moved on real hardware here exactly as the field name
-  //                  says, each change isolated against a control. B1 Pro (model id
-  //                  4097), response 0xD9, 13-byte payload, captures of 2026-08-11.
-  //   "varies"       the byte was seen to move with the right physical event, but WHAT
-  //                  it measures (or in what unit) is not settled. Better than a
-  //                  transcription, short of confirmed.
-  //   "inferred"     not confirmed here. Covers both niimbluelib's transcribed names and
-  //                  a reading the captures support but do not prove (`printLimit`).
-  // `raw` remains the contract: the exact response bytes, the only part that cannot be
-  // wrong. Not for use mid-print: it shares the response waiter queue with the print path.
-  //
-  // DELIBERATELY NOT DECODED, and each for a reason found in those captures:
-  //   idx1  1.4.0 did not decode it; a later reading of its low nibble as an error code
-  //         (0 none / 8 lid open / 3 out of paper) fit the first four captures and was
-  //         REFUTED by c6 — 0x4a, low nibble `a`, taken right after a clean 3-label print
-  //         with nothing wrong. Across the six it reads 88, 80, 83, 80, 80, 74: an analog
-  //         quantity that sagged under load, not an enum. Unexplained; do not name it.
-  //   idx7  `ribbonRfidSuccess` / `ribbonInserted` in 1.4.0. The B1 Pro is direct-thermal
-  //   idx8  and has no ribbon at all, yet 1.4.0 reported `ribbonInserted: true` in every
-  //         capture. A field that is confidently wrong is worse than an absent one.
-  // Their bytes stay in `raw`, so a later capture can still settle them.
-  const OBSERVED = "observed", VARIES = "varies", INFERRED = "inferred";
-
-  // The one configuration whose bytes have actually been seen here: a B1 Pro answering
-  // 0xD9 with a 13-byte payload. The B1 (4096) and M2-H (4608) have NEVER been captured
-  // and may not even use this layout, so they get no hardware claim. That restriction is
-  // not politeness: the NIIMBOT Community Wiki says of this very heartbeat that "for
-  // specific printer models, lid-closed logic is inverted (1 = closed)", and our captures
-  // show 1 = OPEN — so widening `lidClosed` to another model could invert its meaning.
-  const OBSERVED_MODEL_ID = 4097;
-  const observedHere = () => !!(printerInfo && printerInfo.modelId === OBSERVED_MODEL_ID);
-  // The ribbon A/B was run on ONE printer, the M2-H. Scoping by payload length alone
-  // would hand a hardware claim to any other model that happens to answer with 11
-  // bytes — the exact leak the B1-Pro claims are already fenced against.
-  const RIBBON_MODEL_ID = 4608;
-  const ribbonObservedHere = () => !!(printerInfo && printerInfo.modelId === RIBBON_MODEL_ID);
-
-  // niimbluelib abstraction.ts processHeartbeatAdvanced1: these model ids report the
-  // lid byte inverted. None of MODEL_IDS is in it; kept so an unknown printer decodes
-  // the same way niimbluelib would.
-  const INVERTED_LID_MODELS = [512, 513, 514, 272, 273, 274, 1792, 2304, 2560, 3584, 3840, 4352, 5120];
-
-  // Decode a heartbeat response into { hb, ev } — fields and their per-field evidence.
-  // The LAYOUT IS PICKED BY THE RESPONSE OPCODE, then by payload length: `0xD9` is
-  // In_HeartbeatAdvanced2 (what type 04 asks for), `0xDD` is In_HeartbeatAdvanced1.
-  // `0xDE`/`0xDF` (Basic/Unknown) carry no fields niimbluelib decodes, so they yield
-  // null rather than a guess. Polarity for 0xD9 is now the captures', not niimbluelib's,
-  // and they agree: idx4 1 = lid open, idx5 1 = no paper, idx6 1 = tag read ok.
-  function decodeHeartbeat(cmd, d) {
-    const n = d.length;
-    let hb = null;
-    const ev = {};
-    if (cmd === 0xd9) {                       // Advanced2 — needs ≥ 9 bytes
-      if (n < 9) return null;
-      hb = {
-        layout: `advanced2/${n}`,
-        chargeLevel: d[2], temp: d[3],
-        lidClosed: d[4] === 0, paperInserted: d[5] === 0, paperRfidSuccess: d[6] !== 0,
-        ribbonInserted: d[7] === 1,
-      };
-      // Only the captured configuration carries a hardware claim; anything else falls
-      // back to "inferred", which here means "extrapolated and never checked".
-      const seen = observedHere() && n === 13;
-      ev.lidClosed = ev.paperInserted = ev.paperRfidSuccess = seen ? OBSERVED : INFERRED;
-      // ribbonInserted is back, at a DIFFERENT offset from the one that was removed in
-      // 2.0.0. That removal was right: the old offset read `true` on a B1 Pro, which is
-      // direct-thermal and has no ribbon slot at all. d[7] is where it actually lives,
-      // and it was established by the only kind of evidence that settles this — an A/B
-      // on ONE printer, 10 s apart, with nothing changed but the ribbon:
-      //     M2-H, ribbon in:  1f 5d 04 4b 00 00 01 [01] 00 00 00
-      //     M2-H, ribbon out: 1f 5e 04 4b 00 00 01 [00] 00 00 00
-      // and consistent with the B1 Pro (no ribbon, d[7] = 00) across its six captures.
-      // ⚠ THE NAME IS THE WEAK PART, not the measurement. The NIIMBOT Community Wiki
-      // (printers.niim.blue/interfacing/proto) documents TWO adjacent ribbon fields in
-      // Advanced 2 — "Ribbon inserted" and "Ribbon RFID Success" — and pulling the
-      // ribbon zeroes BOTH, so the A/B above cannot say which one d[7] is. It says only
-      // that d[7] tracks the ribbon. `ribbonInserted` is the reading a caller can act on
-      // ("a ribbon is in there and readable"); if a capture ever separates the two,
-      // rename it rather than inventing a second field.
-      // OBSERVED only on the 11-byte layout that A/B was run on; on 13 bytes it agrees
-      // with a printer that HAS no ribbon, which cannot distinguish "absent" from
-      // "field means something else here", so it stays inferred there.
-      ev.ribbonInserted = (ribbonObservedHere() && n === 11) ? OBSERVED : INFERRED;
-      // idx3 rose 0x48 idle → 0x49 before a job → 0x4a right after 3 labels, so it does
-      // track something thermal. The UNIT is not settled: 72–74 is high for °C on a
-      // lightly-used printhead. Hence "varies", not "observed".
-      ev.temp = seen ? VARIES : INFERRED;
-      // idx2 read 0x50 in all six captures — constant is not confirmed, only unrefuted.
-      ev.chargeLevel = INFERRED;
-      // Trailing wifiRssi / lightingErrorCode / voltageState are deliberately NOT
-      // decoded: optional in niimbluelib and unverifiable here. They stay in `raw`.
-    } else if (cmd === 0xdd) {                // Advanced1 — layout keyed off length
-      if (n === 10) hb = { layout: "advanced1/10", lidClosed: d[8] === 0, chargeLevel: d[9] };
-      else if (n === 13) hb = { layout: "advanced1/13", lidClosed: d[9] === 0, chargeLevel: d[10], paperInserted: d[11] === 0, paperRfidSuccess: d[12] !== 0 };
-      else if (n === 19) hb = { layout: "advanced1/19", lidClosed: d[15] === 0, chargeLevel: d[16], paperInserted: d[17] === 0, paperRfidSuccess: d[18] !== 0 };
-      else if (n === 20) hb = { layout: "advanced1/20", paperInserted: d[18] === 0, paperRfidSuccess: d[19] !== 0 };
-      else return null;                       // unknown length → no half-filled object
-      // Advanced1 has never been captured here at all: purely niimbluelib's.
-      for (const k in hb) if (k !== "layout") ev[k] = INFERRED;
-    } else {
-      return null;
-    }
-    if (hb.lidClosed != null && printerInfo && INVERTED_LID_MODELS.indexOf(printerInfo.modelId) >= 0) {
-      hb.lidClosed = !hb.lidClosed;
-    }
-    return { hb, ev };
-  }
-
-  // Decode an RfidInfo (0x1B) payload into { rfid, ev }, per niimbluelib processRfidInfo:
-  //   1 byte                → no tag present
-  //   uuid[8] · barCode(u8 len + bytes) · serial(u8 len + bytes) · printLimit(i16 BE,
-  //   niimbluelib's `allPaper`) · usedPaper(i16 BE) · consumablesType(u8) · [capacity(i16 BE)]
-  // niimbluelib's reader throws on an overrun AND on leftover bytes; both mean the
-  // payload isn't this layout, so both return null here instead of a partial guess.
-  // Two real 41-byte B1 Pro payloads (two different rolls) consume exactly, which
-  // corroborates the STRUCTURE; the field meanings are separate, and marked one by one:
-  //   usedPaper  went 6 → 9 across a 3-label job. Confirmed counter, and independently
-  //              backed by the "printed label cnt" block in the NIIMBOT Community Wiki's
-  //              RFID tag map.
-  //   capacity   read 230, which the printer's owner confirmed is the roll's label count
-  //              when new. Confirmed.
-  //   printLimit niimbluelib calls this `allPaper`; it is NOT a paper total. It read 276
-  //              against a 230-label roll and did not move across a print job, and on a
-  //              second roll it read 120 against a capacity of 100 — the same 1.2 ratio,
-  //              exactly. The wiki's tag map lists a "print limited cnt", so the reading
-  //              is the consumable's DRM cap, provisioned at 120 % of nominal. Two rolls,
-  //              one model, one label type: a well-supported inference, not a validated
-  //              field. See docs/protocol-v4.md § Consumable status.
-  // Never observed to VARY, so never promoted however sane they look: `consumablesType`
-  // read 1 ("with gaps") on both rolls, and uuid/barCode/serialNumber differ per roll
-  // without anything here confirming which is which.
-  function decodeRfid(d) {
-    if (d.length === 1) return { rfid: { tagPresent: false }, ev: { tagPresent: INFERRED } };
-    let o = 0;
-    const left = () => d.length - o;
-    const i8 = () => d[o++];
-    const i16 = () => { const v = ((d[o] << 8) | d[o + 1]) << 16 >> 16; o += 2; return v; };  // signed BE
-    const str = (k) => { let s = ""; for (let i = 0; i < k; i++) s += String.fromCharCode(d[o + i]); o += k; return s; };
-    if (left() < 8) return null;
-    const uuid = Array.from(d.slice(0, 8)).map(h2).join("");
-    o = 8;
-    if (left() < 1 || left() < 1 + d[o]) return null;
-    const barCode = str(i8());
-    if (left() < 1 || left() < 1 + d[o]) return null;
-    const serialNumber = str(i8());
-    if (left() < 5) return null;                            // printLimit + usedPaper + type
-    const info = { tagPresent: true, uuid, barCode, serialNumber, printLimit: i16(), usedPaper: i16(), consumablesType: i8() };
-    if (left() === 2) info.capacity = i16();
-    if (left() !== 0) return null;                          // extra data → not this layout
-    // Unlike the heartbeat, this layout is self-describing (length-prefixed strings), so
-    // a field keeps its meaning at any payload size — the model is the only scope needed.
-    const seen = observedHere();
-    const ev = {
-      tagPresent: INFERRED, uuid: INFERRED, barCode: INFERRED, serialNumber: INFERRED,
-      consumablesType: INFERRED, printLimit: INFERRED,
-      usedPaper: seen ? OBSERVED : INFERRED,
-    };
-    if (info.capacity != null) ev.capacity = seen ? OBSERVED : INFERRED;
-    return { rfid: info, ev };
-  }
-
-  // Ask the printer for its consumable status. Advisory only — see the block above.
-  // Returns { raw: { heartbeat, heartbeatCmd, rfid }, decoded, confidence }:
-  //   raw.heartbeat / raw.rfid  exact response payload bytes (Uint8Array) or null
-  //   raw.heartbeatCmd          the response opcode, since it selects the layout
-  //   decoded                   { heartbeat, rfid, evidence } — `heartbeat` and `rfid`
-  //                             each independently null when that layout isn't
-  //                             recognised, `evidence` the per-field trust map
-  //                             ({ heartbeat, rfid }, matching keys); null when neither
-  //                             part decoded
-  //   confidence                a floor over `decoded.evidence`, kept for callers written
-  //                             against 1.4.0: "validated" when at least one decoded
-  //                             field is "observed" | "inferred" when something decoded
-  //                             but nothing is confirmed | "unknown" when nothing did.
-  //                             It is deliberately coarse — read `evidence` per field.
-  // A missing 0x1B is NORMAL — many models/consumables never answer — so it times out
-  // quietly and reports rfid: null rather than throwing.
-  async function getStatus(opts) {
-    // Name WHICH condition failed. The three have different causes and the old single
-    // message hid that: `device` null means disconnect() was called, `characteristic`
-    // null means the gattserverdisconnected event fired (the browser saw a drop), and
-    // gatt.connected false means the link is down WITHOUT that event having run. A
-    // session that ends unexpectedly is diagnosable only if these are told apart.
-    if (!device) {
-      throw new Error("Not connected — no device (disconnect() was called, or connect() never ran). Call Niimbot.connect(model) or Niimbot.identify(model) first.");
-    }
-    if (!characteristic) {
-      throw new Error("Not connected — the link dropped (gattserverdisconnected fired and cleared the characteristic). Reconnect with Niimbot.connect(model).");
-    }
-    if (!(device.gatt && device.gatt.connected)) {
-      throw new Error("Not connected — device.gatt.connected is false while the characteristic is still held, so the link went down without the disconnect event running. Reconnect with Niimbot.connect(model).");
-    }
-    const o = opts || {};
-    const hbTimeout = o.timeoutMs != null ? o.timeoutMs : 1000;
-    const rfidTimeout = o.rfidTimeoutMs != null ? o.rfidTimeoutMs : 600;
-    // Accept ANY response opcode (wantResp null, as the handshake's info reads do)
-    // instead of insisting on 0xD9: a printer that answers a different heartbeat
-    // variant still hands us its raw bytes, which is the point. The opcode picks the
-    // layout in decodeHeartbeat.
-    const hb = await sendWait(0xdc, [0x04], null, hbTimeout);      // Heartbeat, type 04
-    const rf = await sendWait(0x1a, [0x01], 0x1b, rfidTimeout);    // RfidInfo (optional)
-    const hbDec = hb ? decodeHeartbeat(hb.cmd, hb.data) : null;
-    const rfDec = rf ? decodeRfid(rf.data) : null;
-    let decoded = null;
-    if (hbDec || rfDec) {
-      decoded = {
-        heartbeat: hbDec ? hbDec.hb : null,
-        rfid: rfDec ? rfDec.rfid : null,
-        evidence: { heartbeat: hbDec ? hbDec.ev : null, rfid: rfDec ? rfDec.ev : null },
-      };
-    }
-    return {
-      raw: {
-        heartbeat: hb ? Uint8Array.from(hb.data) : null,
-        heartbeatCmd: hb ? hb.cmd : null,
-        rfid: rf ? Uint8Array.from(rf.data) : null,
-      },
-      decoded,
-      confidence: decoded ? (hasObserved(decoded.evidence) ? "validated" : "inferred") : "unknown",
-    };
-  }
-
-  function hasObserved(evidence) {
-    for (const part in evidence) {
-      const m = evidence[part];
-      for (const k in m) if (m[k] === OBSERVED) return true;
-    }
-    return false;
-  }
-
-  // REPORT — never enforce — whether a status looks print-ready. Pure: it takes what
-  // getStatus() returned and calls nothing, so it can never delay or alter a print. It
-  // exists so a future gate is easy to write in the APP, and is deliberately not wired
-  // into printImage/printBatch: lid and paper are confirmed on one model from six
-  // captures, which is not enough to refuse a job here.
-  //   { ready: true | false | null, reasons: [strings], evidence: <weakest marker used> }
-  // `ready` is null when nothing decoded bears on readiness — "cannot tell" and "not
-  // ready" must not collapse into the same answer.
-  function readiness(status) {
-    const dec = status && status.decoded;
-    const hb = dec && dec.heartbeat;
-    const ev = (dec && dec.evidence && dec.evidence.heartbeat) || {};
-    const reasons = [];
-    const used = [];
-    if (hb && hb.lidClosed != null) { used.push(ev.lidClosed); if (!hb.lidClosed) reasons.push("lid open"); }
-    if (hb && hb.paperInserted != null) { used.push(ev.paperInserted); if (!hb.paperInserted) reasons.push("no paper"); }
-    if (!used.length) return { ready: null, reasons: ["nothing decoded that bears on readiness"], evidence: null };
-    const rank = [INFERRED, VARIES, OBSERVED];
-    let weakest = OBSERVED;
-    for (const m of used) {
-      const mm = rank.indexOf(m) < 0 ? INFERRED : m;   // an unmarked field is not a claim
-      if (rank.indexOf(mm) < rank.indexOf(weakest)) weakest = mm;
-    }
-    return { ready: reasons.length === 0, reasons, evidence: weakest };
-  }
-
-  // REPORT the battery level, per model. Pure like readiness(): it reads a getStatus()
-  // result (plus the currently identified printer's `batteryScale`, see MODEL_IDS
-  // above) and calls nothing — it never connects, never blocks, never feeds a print
-  // path. The same heartbeat byte (idx2, `chargeLevel`) means two different things
-  // depending on the model, and conflating them is exactly how a wrong number gets
-  // shown: "percent" printers already send 0-100; "enum" printers send a 0-4 level
-  // (0=0%, 1=25%, 2=50%, 3=75%, 4=100%). A raw value outside its model's range is a
-  // CONTRADICTION, not a rounding job — it is reported as "unknown" rather than
-  // silently coerced into a plausible-looking number.
-  //   { raw, scale: "percent" | "enum" | "unknown", percent: number | null, text, evidence } | null
-  // `evidence` is exactly what getStatus() already marked for chargeLevel — this
-  // function invents no trust level of its own.
-  function battery(status) {
-    const dec = status && status.decoded;
-    const hb = dec && dec.heartbeat;
-    const raw = hb ? hb.chargeLevel : undefined;
-    if (raw == null) return null;
-    const evidence = (dec.evidence && dec.evidence.heartbeat && dec.evidence.heartbeat.chargeLevel) || null;
-    const meta = (printerInfo && printerInfo.modelId != null) ? MODEL_IDS[printerInfo.modelId] : null;
-    const baseScale = meta ? meta.batteryScale : null;
-    if (baseScale === "percent") {
-      if (raw > 100) return { raw, scale: "unknown", percent: null, text: `unknown (raw ${raw} on a 0-100 scale)`, evidence };
-      return { raw, scale: "percent", percent: raw, text: `${raw}%`, evidence };
-    }
-    if (baseScale === "enum") {
-      if (raw > 4) return { raw, scale: "unknown", percent: null, text: `unknown (raw ${raw} on a 0-4 scale)`, evidence };
-      const percent = raw * 25;
-      return { raw, scale: "enum", percent, text: `${percent}% (level ${raw} of 4)`, evidence };
-    }
-    // Printer unidentified (no MODEL_IDS match): the SCALE itself is unknown here, not
-    // just the value — the same byte reads as "%" on some models and "level 0-4" on
-    // others, so there is nothing to convert against.
-    return { raw, scale: "unknown", percent: null, text: `unknown (raw ${raw}, printer not identified)`, evidence };
-  }
-
   // ── Bitmap: image → rows packed MSB-first (1 = black) ───────────────────────
-  async function imageToPacked(url, w, h, offsetY) {
+  function imageToPacked(bmp, w, h, offsetY) {
     const dy = offsetY | 0;   // print-position calibration (paper registration, not scale — w/h stay put); dy > 0 shifts down, dy < 0 shifts up
-    const bmp = await fetch(url).then((r) => r.blob()).then((b) => createImageBitmap(b));
     const canvas = document.createElement("canvas");
     canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext("2d");
@@ -989,10 +636,21 @@
       if (isVoid) {
         await sendBundled(0x84, [(r >> 8) & 0xff, r & 0xff, run]);
       } else {
-        const total = popcountRow(buf, off, stride);
+
         const data = new Array(6 + stride);
         data[0] = (r >> 8) & 0xff; data[1] = r & 0xff; data[2] = 0;
-        data[3] = total & 0xff; data[4] = (total >> 8) & 0xff; data[5] = run;
+        if (printerInfo?.modelId === 785) {
+          // Three banks of 192 printhead dots, 24 packed bytes per bank.
+          for (let bank = 0; bank < 3; bank++) {
+            const start = bank * 24;
+            data[2 + bank] = popcountRow(buf, off + start, Math.max(0, Math.min(24, stride - start)));
+          }
+        } else {
+          const total = popcountRow(buf, off, stride);
+          data[3] = total & 0xff;
+          data[4] = (total >> 8) & 0xff;
+        }
+        data[5] = run;
         for (let b = 0; b < stride; b++) data[6 + b] = buf[off + b];
         await sendBundled(0x85, data);
       }
@@ -1236,6 +894,8 @@
 
   async function endJob(strict) {
     await waitForPrintReply(0xf3, [0x01], 0xf4, 2500, strict);
+    // B21 Pro may drop the first packet after PrintEnd (niimbluelib D110MV4PrintTask).
+    if (printerInfo?.modelId === 785) await send(0xdc, [0x01]);
   }
 
   // Finalize the job: poll the printed-page counter to `target` (so PrintEnd doesn't
@@ -1274,301 +934,22 @@
     onProgress?.("ok");
   }
 
-  // Print one image, optionally `opts.copies` times. Like niim.blue, copies are
-  // declared once (PrintStart pages + SetPageSize copies) and the image is uploaded
-  // ONCE — the printer repeats it internally, continuously, no re-upload per copy.
-  async function printImage(url, opts) {
-    opts = opts || {};
-    const { model, size, onProgress } = opts;
-    const copies = Math.max(1, opts.copies | 0);
-    const density = densityFor(model, opts);   // validate BEFORE touching the printer
-    onProgress && onProgress("connecting…");
-    await connect(model);
-    assertSelection(model, size);
-    const offsetY = opts.offsetY != null ? opts.offsetY : (size.offset_y_px || 0);
-    const { buf, stride } = await imageToPacked(url, size.w_px, size.h_px, offsetY);
-    _t0 = Date.now(); _lastPage = -1;                                        // timing trace (DEBUG)
-
-    // pagesPerJob: 1 — this printer acks a multi-page/multi-copy job but only actually
-    // prints the first page (see MODEL_IDS `2304` comment). Fall back to N separate
-    // complete jobs instead. NOT gated behind DEBUG: the caller asked for one upload and
-    // is about to wait N× as long for it, with the image crossing BLE N times instead of
-    // once — silence here would just look like a slow print.
-    const meta = connectedMeta();
-    if (meta && meta.pagesPerJob === 1 && copies > 1) {
-      logAlways(`⚠ ${meta.label} only prints page 1 of a multi-page job (measured 2026-08-14) — printing ${copies} copies as ${copies} separate jobs; the image crosses BLE ${copies} times.`);
-      for (let i = 0; i < copies; i++) {
-        const tag = `copy ${i + 1}/${copies}`;
-        _lastPage = -1; _pageSeen = null;   // the printer's page counter resets at the start of EACH job (measured) — don't carry a stale value into the next one
-        await beginJob(model, 1, (s) => onProgress && onProgress(`${tag}: ${s}`), density);
-        tlog(`${tag}: job started (${size.w_px}×${size.h_px}, stride ${stride})`);
-        const acked = await sendPagePacked(model, size, buf, stride, 1, (s) => onProgress && onProgress(`${tag}: ${s}`), tag);
-        tlog(acked ? `${tag}: PageEnd acked` : `${tag}: image sent but PageEnd went UNACKED`);
-        if (!acked) {
-          await endJob();                     // feed the paper out before failing (see finishJob)
-          throw unconfirmed(`the printer never acknowledged PageEnd for ${tag} after ${PAGE_ACK_MS}ms`);
-        }
-        await finishJob(model, 1, (s) => onProgress && onProgress(`${tag}: ${s}`));
+  return async function print(canvas, model, size, beforePrint) {
+    try {
+      await connect(model);
+      if (![528, 785].includes(model.id) || printerInfo?.modelId !== model.id) {
+        throw new Error(`Выберите принтер NIIMBOT ${model.name}.`);
       }
-      tlog(`done (${copies} separate jobs, PrintEnd acked each)`);
-      onProgress && onProgress("ok");
-      return;
+      assertSelection(model, size);
+      beforePrint();
+      const { buf, stride } = imageToPacked(canvas, size.w_px, size.h_px, size.offset_y_px);
+      await printConfirmedImage(model, size, buf, stride, 1, null, densityFor(model, {}));
+    } finally {
+      await disconnect();
     }
-
-    if (opts.strictAcknowledgements === true) {
-      await printConfirmedImage(model, size, buf, stride, copies, onProgress, density);
-      return;
-    }
-    await beginJob(model, copies, onProgress, density);
-    tlog(`job started (${copies} cop${copies > 1 ? "ies" : "y"}, ${size.w_px}×${size.h_px}, stride ${stride})`);
-    const acked = await sendPagePacked(model, size, buf, stride, copies, onProgress);
-    // Only claim the ack when there was one. The old line said "(PageEnd acked)"
-    // unconditionally, including directly under the ⚠ warning that nothing answered.
-    tlog(acked ? `PageEnd acked` : `image sent but PageEnd went UNACKED`);
-    if (!acked) {
-      await endJob();                       // feed the paper out before failing (see finishJob)
-      throw unconfirmed(`the printer never acknowledged PageEnd for the image after ${PAGE_ACK_MS}ms`);
-    }
-    await finishJob(model, copies, onProgress);
-    tlog(`done (PrintEnd acked)`);
-    onProgress && onProgress("ok");
-  }
-
-  // Keep at most this many pages buffered ahead of what has actually printed.
-  // A page's send time is significant vs. its print time, so 1 page of head start
-  // isn't enough — the next send loses the race and stalls. 2 gives each send a
-  // full extra page of print-time to land, while a long batch still can't overrun
-  // the printer's line buffer.
-  const LOOKAHEAD = 2;
-
-  async function printBatch(urls, opts) {
-    opts = opts || {};
-    const { model, size, onProgress } = opts;
-    const density = densityFor(model, opts);   // validate BEFORE touching the printer
-    onProgress && onProgress("connecting…");
-    await connect(model);
-    assertSelection(model, size);
-    const N = urls.length;
-    const offsetY = opts.offsetY != null ? opts.offsetY : (size.offset_y_px || 0);
-    _t0 = Date.now(); _lastPage = -1;                                       // reset timing trace
-
-    // pagesPerJob: 1 — see printImage for the same guard. A multi-page batch job on
-    // this printer would ack every command and print only the first label, so run N
-    // separate complete jobs instead: connect → job → job → … Semantics for the
-    // caller are unchanged (N urls in ⇒ N labels out); only the wire behavior differs.
-    const meta = connectedMeta();
-    if (meta && meta.pagesPerJob === 1 && N > 1) {
-      logAlways(`⚠ ${meta.label} only prints page 1 of a multi-page job (measured 2026-08-14) — sending ${N} labels as ${N} separate jobs; the image crosses BLE ${N} times.`);
-      for (let i = 0; i < N; i++) {
-        const tag = `label ${i + 1}/${N}`;
-        onProgress && onProgress(`${tag}: sending…`);
-        const { buf, stride } = await imageToPacked(urls[i], size.w_px, size.h_px, offsetY);
-        tlog(`${tag}: start sending`);
-        _lastPage = -1; _pageSeen = null;   // the printer's page counter resets at the start of EACH job (measured) — don't carry a stale value into the next one
-        await beginJob(model, 1, (s) => onProgress && onProgress(`${tag}: ${s}`), density);
-        const acked = await sendPagePacked(model, size, buf, stride, 1, (s) => onProgress && onProgress(`${tag}: ${s}`), tag);
-        tlog(acked ? `${tag}: PageEnd acked` : `${tag}: sent but PageEnd went UNACKED`);
-        if (!acked) {
-          await endJob();                   // feed the paper out before failing (see finishJob)
-          throw unconfirmed(`page ${i + 1} of ${N} was never acknowledged after ${PAGE_ACK_MS}ms (no PageEnd ack)`);
-        }
-        await finishJob(model, 1, (s) => onProgress && onProgress(`${tag}: ${s}`));
-      }
-      tlog(`done (${N} separate jobs, PrintEnd acked each)`);
-      onProgress && onProgress("ok");
-      return;
-    }
-
-    // PAGE_PIPELINE (diagnostic, default off — see its declaration above): the same
-    // single job, the same page order, the same LOOKAHEAD throttle on the printer's
-    // OWN page counter — the only difference is that PageEnd's ack (0xE4) is not
-    // awaited per page. Every page's ack is collected instead and covered in full
-    // before PrintEnd, so the guarantee holds exactly as below: any page whose ack
-    // never came back still ends the job as unconfirmed, PrintEnd sent first, throw
-    // after. With the flag off, execution never reaches this branch.
-    if (PAGE_PIPELINE) {
-      await beginJob(model, N, onProgress, density);
-      tlog(`job started (${N} pages) [PAGE_PIPELINE]`);
-      let problem = null;
-      const acks = []; // { i, ackPromise } for every page's deferred PageEnd ack, in send order
-      for (let i = 0; i < N && !problem; i++) {
-        const tag = `label ${i + 1}/${N}`;
-        onProgress && onProgress(`${tag}: sending…`);
-        const { buf, stride } = await imageToPacked(urls[i], size.w_px, size.h_px, offsetY);
-        tlog(`page ${i}: start sending`);
-        const { ackPromise } = await sendPagePacked(model, size, buf, stride, 1,
-          (s) => onProgress && onProgress(`${tag}: ${s}`), tag, true);
-        acks.push({ i, ackPromise });
-        // Same look-ahead throttle as the non-pipelined path, on the printer's OWN
-        // page counter (0xA3→0xB3) — unrelated to whether THIS page's PageEnd ack has
-        // arrived, so it is untouched by the deferral above.
-        if (i - LOOKAHEAD >= 0) {
-          const want = i - LOOKAHEAD + 1;
-          if (!await waitPage(want, (s) => onProgress && onProgress(`${tag}: ${s}`))) {
-            problem = `printer counter stalled at page ${_pageSeen == null ? "?" : _pageSeen} of ${want} while streaming (${PAGE_WAIT_MS}ms)`;
-          }
-        }
-      }
-      // Cover every outstanding PageEnd ack before PrintEnd — the one guarantee this
-      // flag must never break. Every promise is awaited even after the first failure,
-      // so nothing is left registered in the notification dispatcher's waiter queue
-      // when PrintEnd goes out.
-      for (const { i, ackPromise } of acks) {
-        const acked = await ackPromise;
-        if (!problem && !acked) {
-          problem = `page ${i + 1} of ${N} was never acknowledged after ${PAGE_ACK_MS}ms (no PageEnd ack)`;
-        }
-      }
-      if (!problem && !await waitPage(N, onProgress)) {                     // drain remaining pages
-        problem = `printer counter stopped at page ${_pageSeen == null ? "?" : _pageSeen} of ${N} after ${PAGE_WAIT_MS}ms`;
-      }
-      // PrintEnd goes out either way — it is what feeds out and retracts the paper.
-      // The throw comes after, never instead. (See finishJob for the same ordering.)
-      tlog(problem ? `job UNCONFIRMED (${problem}); sending PrintEnd anyway` : `all ${N} pages printed; sending PrintEnd`);
-      await endJob();
-      if (problem) throw unconfirmed(problem);
-      tlog(`PrintEnd acked (batch done); total ${Date.now() - _t0} ms [PAGE_PIPELINE]`);
-      onProgress && onProgress("ok");
-      return;
-    }
-
-    // Single job for the whole batch (both tasks): pages stream back-to-back, no
-    // retract between. The B1 (protocol 3) supports this natively — printStart7b
-    // with totalPages>1 parks the paper at the printhead after each PageEnd and only
-    // feeds out on the final PrintEnd (verified against niimbluelib's B1PrintTask).
-    await beginJob(model, N, onProgress, density);
-    tlog(`job started (${N} pages)`);
-    // Anything that means "the printer stopped confirming" stops the loop. Sending more
-    // pages into a printer that is not keeping up is how a batch ends up short AND
-    // desynchronised — the 4-of-5 run on 2026-08-13 came out with every label numbered 1.
-    let problem = null;
-    for (let i = 0; i < N && !problem; i++) {
-      const tag = `label ${i + 1}/${N}`;
-      onProgress && onProgress(`${tag}: sending…`);
-      const { buf, stride } = await imageToPacked(urls[i], size.w_px, size.h_px, offsetY);
-      tlog(`page ${i}: start sending`);
-      const acked = await sendPagePacked(model, size, buf, stride, 1,
-        (s) => onProgress && onProgress(`${tag}: ${s}`), tag);
-      tlog(acked ? `page ${i}: PageEnd acked` : `page ${i}: sent but PageEnd went UNACKED`);
-      if (!acked) { problem = `page ${i + 1} of ${N} was never acknowledged after ${PAGE_ACK_MS}ms (no PageEnd ack)`; break; }
-      // Send page i, THEN wait for page i-LOOKAHEAD to finish — so the just-sent
-      // page is already buffered before the printer needs it (no inter-label stop).
-      if (i - LOOKAHEAD >= 0) {
-        const want = i - LOOKAHEAD + 1;
-        if (!await waitPage(want, (s) => onProgress && onProgress(`${tag}: ${s}`))) {
-          problem = `printer counter stalled at page ${_pageSeen == null ? "?" : _pageSeen} of ${want} while streaming (${PAGE_WAIT_MS}ms)`;
-        }
-      }
-    }
-    if (!problem && !await waitPage(N, onProgress)) {                       // drain remaining pages
-      problem = `printer counter stopped at page ${_pageSeen == null ? "?" : _pageSeen} of ${N} after ${PAGE_WAIT_MS}ms`;
-    }
-    // PrintEnd goes out either way — it is what feeds out and retracts the paper.
-    // The throw comes after, never instead. (See finishJob for the same ordering.)
-    tlog(problem ? `job UNCONFIRMED (${problem}); sending PrintEnd anyway` : `all ${N} pages printed; sending PrintEnd`);
-    await endJob();
-    if (problem) throw unconfirmed(problem);
-    tlog(`PrintEnd acked (batch done)`);
-    onProgress && onProgress("ok");
-  }
-
-  return {
-    VERSION, SVC_UUID, CHAR_UUID,
-    get DEBUG() { return DEBUG; }, set DEBUG(v) { DEBUG = !!v; },
-    get BUNDLE_MAX() { return BUNDLE_MAX; }, set BUNDLE_MAX(v) { BUNDLE_MAX = Math.max(0, v | 0); },
-    // Override the per-model bundling decision: null (auto, the default) | true | false.
-    // DIAGNOSTIC — see the bundleOverride declaration above. Anything else throws rather
-    // than being silently ignored.
-    get BUNDLE() { return bundleOverride; },
-    set BUNDLE(v) {
-      if (v !== null && v !== true && v !== false) {
-        throw new TypeError(`Niimbot.BUNDLE must be null, true, or false — got ${JSON.stringify(v)}.`);
-      }
-      bundleOverride = v;
-      logAlways(`BUNDLE override = ${v === null ? "auto" : v} → effective=${effectiveBundle()} (detected=${_bundleAllowed})`);
-    },
-    // What the driver DETECTED for the connected model, and what sendBundled is
-    // actually using now — the pair a tester needs to tell "the override took effect"
-    // from "it was already that". Same pairing as DETECTED_WRITE_MODE/EFFECTIVE_WRITE_MODE.
-    get DETECTED_BUNDLE() { return _bundleAllowed; },
-    get EFFECTIVE_BUNDLE() { return effectiveBundle(); },
-    get PACE_MS() { return PACE_MS; }, set PACE_MS(v) { PACE_MS = Math.max(0, v | 0); },
-    // How long to wait for ONE page's PageEnd ack — NOT PAGE_WAIT_MS below, which is the
-    // whole job's printed-page counter deadline. See sendPagePacked's comment.
-    get PAGE_ACK_MS() { return PAGE_ACK_MS; }, set PAGE_ACK_MS(v) { PAGE_ACK_MS = Math.max(1, v | 0); },
-    // How long to wait for the printed-page counter before declaring a job unconfirmed.
-    get PAGE_WAIT_MS() { return PAGE_WAIT_MS; }, set PAGE_WAIT_MS(v) { PAGE_WAIT_MS = Math.max(1, v | 0); },
-    // DIAGNOSTIC, default false — see the PAGE_PIPELINE declaration for what it does
-    // and why it is not a setting yet. Streams the next page's data before the
-    // current page's PageEnd ack has come back, in printBatch's single-job loop only.
-    get PAGE_PIPELINE() { return PAGE_PIPELINE; }, set PAGE_PIPELINE(v) { PAGE_PIPELINE = !!v; },
-    // Override the DETECTED write path: null (auto) | "fast" | "paced" | "acked".
-    // Applied at write time, so it can be flipped mid-connection; anything else throws
-    // rather than being ignored. See the "Write-mode override" block above.
-    get WRITE_MODE() { return writeOverride; }, set WRITE_MODE(v) { setWriteOverride(v); },
-    // What the driver DETECTED at connect, and what writes are actually using — the
-    // pair a tester needs to tell "the override took effect" from "it was already that".
-    get DETECTED_WRITE_MODE() { return writeMode; },
-    get EFFECTIVE_WRITE_MODE() { return effectiveWriteMode(); },
-    // DEPRECATED alias over WRITE_MODE, kept because it is published API as of 1.4.0:
-    // true ⇔ override "paced"; `= false` clears the override entirely (including a
-    // "fast" or "acked" one — a boolean cannot say "not paced, but keep that").
-    get FORCE_PACING() { return writeOverride === "paced"; },
-    set FORCE_PACING(v) { setWriteOverride(v ? "paced" : null); },
-    get printer() { return printerInfo; },   // { modelId, protocolVersion, label, task, dpi } after connect
-    isSupported: () => !!navigator.bluetooth,
-    // NOT PUBLISHED API — reaches the notification dispatcher (pendingQueue,
-    // registerWait/clearWait, onNotify) directly for test/dispatch.test.js. Every real
-    // caller today (sendWait, getPrintStatus) awaits one waiter before registering the
-    // next, so nothing in normal use ever has two waiters outstanding at once — there is
-    // no public entry point that can drive the queue concurrently to exercise it. May
-    // change or disappear without notice; do not build application code on it.
-    _dispatch: {
-      registerWait, clearWait, onNotify,
-      get pendingQueue() { return pendingQueue; },
-      get lastUnsolicited() { return lastUnsolicited; },
-    },
-    // ── DIAGNOSTIC, not API ────────────────────────────────────────────────────
-    // Send one command and return whatever comes back, accepting ANY response opcode:
-    //   await Niimbot.probe(0x1a, [0x02])   → { cmd, data } | null
-    // It exists because protocol questions get answered by asking the printer, and the
-    // alternative is guessing. Added 2026-08-13 while hunting where the M2-H reports
-    // remaining RIBBON: every response the driver already collects (the whole b1
-    // handshake, 0xA5→0xB5, all 0x40 info reads, the heartbeat and the RFID payload) is
-    // byte-identical between a nearly-full ribbon and a half-spent one, so the figure
-    // the official app shows must come from something nobody here asks for.
-    //
-    // ⚠ SWEEP SUB-CODES, NOT TOP-LEVEL OPCODES. Probing 0x40[00..20] or 0x1A[01..05] is
-    // reading. Sweeping the top-level command space blind is not: this protocol has
-    // commands that print, feed, write RFID and update firmware, and an unknown opcode
-    // may be one of them. Nothing in the driver calls this.
-    probe: async (cmd, data, timeoutMs) => {
-      if (!characteristic) throw new Error("Not connected — probe needs an open connection.");
-      return await sendWait(cmd, data || [], null, timeoutMs != null ? timeoutMs : 400);
-    },
-    // Connect and identify the printer (model id + protocol) without printing — the
-    // app can read the returned info to auto-select the right model/size.
-    identify: async (model) => { await connect(model); return printerInfo; },
-    // Consumable status (lid/paper/RFID). ADVISORY: the driver itself never reads it.
-    // Trust is PER FIELD — `decoded.evidence` says which fields were confirmed on real
-    // hardware (B1 Pro only) and which are still niimbluelib's transcription. See the
-    // "Consumable status" block above. `raw` carries the exact response bytes.
-    getStatus,
-    // Pure reporter over a getStatus() result — { ready, reasons, evidence }. NOT wired
-    // into any print path, by design; call it yourself if your app wants to warn.
-    readiness,
-    // Pure reporter over a getStatus() result — { raw, scale, percent, text, evidence }
-    // | null. Reads the byte per the CONNECTED model's batteryScale (MODEL_IDS); see
-    // the function above for what "percent" vs "enum" vs a contradiction means. NOT
-    // wired into any print path.
-    battery,
-    connect, disconnect, printImage, printBatch,
   };
-  } // createInstance
+}
 
-  // The global is the default instance plus the factory. `create()` returns a fresh,
-  // fully independent driver (own connection, own settings) for a second printer.
-  const Niimbot = createInstance();
-  Niimbot.create = createInstance;
-  root.Niimbot = Niimbot;
-})(typeof window !== "undefined" ? window : globalThis);
+export function printLabel(canvas, model, size, beforePrint) {
+  return createInstance()(canvas, model, size, beforePrint);
+}
